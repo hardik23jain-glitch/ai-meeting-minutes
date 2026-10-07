@@ -263,8 +263,9 @@ def find_protected_names(text, glossary) -> set:
 # --------------------------------------------------------------------------
 _SYSTEM = (
     "You are a speech-recognition error detector for a work-meeting "
-    "transcript. Find ONLY misrecognised technical terms, product names and "
-    "acronyms. Return JSON: {\"errors\": [{\"original\": \"...\", "
+    "transcript. Find ONLY misrecognised technical terms, product names, "
+    "acronyms and common meeting words (deadline, timeline, owner, milestone, "
+    "budget). Return JSON: {\"errors\": [{\"original\": \"...\", "
     "\"correction\": \"...\"}]}.\n"
     "Rules:\n"
     "1. \"original\" must be copied EXACTLY from the transcript and be as "

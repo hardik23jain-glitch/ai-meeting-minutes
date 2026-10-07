@@ -369,5 +369,3 @@ Guarantees:
 - Xie et al. (2025). Inter-stage validation in LLM pipelines.
 
 ---
-
-*Built for the Inter IIT Bootcamp Phase 2, ML Problem Statement, IIT Guwahati Tech Board.*
