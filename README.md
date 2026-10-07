@@ -31,10 +31,11 @@ Meeting-summarisation systems fail in predictable ways: speech-to-text hallucina
    │
    ▼
 ┌──────────────────────────────┐
-│ Stage 1  Speech-to-Text      │  VAD chunking → 16 kHz mono → Whisper large-v3
-│ pipeline/stt.py              │  → hallucination filters
+│ Stage 1  Speech-to-Text      │  ffmpeg → 16 kHz mono PCM → WebRTC VAD
+│ pipeline/stt.py              │  → speech chunks (≤300 s) → Whisper large-v3
+│                              │  → hallucination filters
 └──────────────┬───────────────┘
-               │  raw transcript
+               │  raw transcript (+ dropped / flagged segment logs)
                ▼
 ┌──────────────────────────────┐
 │ Stage 2  Refinement          │  Glossary retrieval → LLM *proposes* edits
@@ -58,7 +59,7 @@ Meeting-summarisation systems fail in predictable ways: speech-to-text hallucina
 
 | Stage | Model | Served via | Responsibility |
 |---|---|---|---|
-| 1. Speech-to-Text | `whisper-large-v3` | Groq API | Transcribes speech segments to raw text |
+| 1. Speech-to-Text | `whisper-large-v3` | Groq API | Transcribes speech chunks to text and returns per-segment confidence diagnostics |
 | 2. Refinement | `openai/gpt-oss-20b` | Groq API | Detects misrecognised technical terms and *proposes* `{original, correction}` pairs. It never regenerates the transcript. |
 | 3. Documentation | `openai/gpt-oss-120b` | Groq API | Topic segmentation, structured minutes, critic pass and verification checks |
 
@@ -68,7 +69,7 @@ The smaller model handles the narrow, constrained detection task in Stage 2. The
 
 | Hand-off | Payload | Validation before next stage |
 |---|---|---|
-| Stage 1 → 2 | Raw transcript string | Rejects empty output and transcripts under a minimum word count |
+| Stage 1 → 2 | Raw transcript string (plus dropped and flagged segment logs and audio statistics) | Rejects unreadable, empty or silent audio, and transcripts under 10 words |
 | Stage 2 → 3 | Refined transcript + `RefineResult` (applied, rejected) | Numbers and negations must be identical before and after refinement, otherwise the refinement is reverted |
 | Stage 3 → UI | Structured record + audit rows | Pydantic schema validation, with one retry on malformed JSON |
 
@@ -80,24 +81,40 @@ Failures raise a `PipelineError` carrying a user-readable message, which the UI 
 
 ### Stage 1: Audio → Raw transcript
 
-- **Whisper large-v3** via Groq for strong zero-shot ASR across accents and domains (Radford et al., 2022).
-- **WhisperX-style VAD chunking** (Bain et al., Interspeech 2023). WebRTC voice-activity detection cuts the recording into speech segments, so Whisper is not fed long silences or noise, which are the main trigger for hallucination.
-- **16 kHz mono downsampling** keeps each request under the API file-size limit, so recordings of up to 500 MB can be processed in segments.
-- **Careless Whisper hallucination filters** (Koenecke et al., FAccT 2024). Segment output is discarded when it shows hallucination signatures:
-  - high `no_speech_prob`
-  - low `avg_logprob`
-  - abnormal compression ratio
-  - repetition streaks (the same phrase looping)
+- **Whisper large-v3** via Groq for strong zero-shot ASR across accents and domains (Radford et al., 2022), with `temperature=0`, the language pinned to English and a meeting-domain prompt.
+- **Decode and downsample.** FFmpeg converts any supported container to raw **16 kHz, mono, 16-bit PCM** (32,000 bytes per second). 16 kHz gives an 8 kHz Nyquist limit, enough to preserve speech formants and fricatives, and it is the rate Whisper was trained on.
+- **WhisperX-style VAD chunking** (Bain et al., Interspeech 2023). WebRTC voice-activity detection classifies 30 ms frames as speech or non-speech (aggressiveness 2). The pipeline then:
+  1. turns consecutive speech frames into regions
+  2. bridges pauses of up to 0.6 s
+  3. drops blips shorter than 0.25 s
+  4. pads each region by 0.2 s on both sides
+  5. packs regions into chunks of at most **300 s** of speech (about 9.6 MB of WAV each, well under Groq's 25 MB limit regardless of the original upload size), with 0.2 s of silence inserted between regions
+- **Graceful degradation.** If `webrtcvad` is unavailable, the stage falls back to fixed-length 300 s chunks without silence removal rather than crashing, and records `vad_used: false` in its statistics.
+- **Careless Whisper hallucination filters** (Koenecke et al., FAccT 2024). The pipeline requests `verbose_json` and assesses every segment using Whisper's own diagnostics (`no_speech_prob`, `avg_logprob`, `compression_ratio`), plus repetition and stock-phrase checks. The first matching rule wins:
+
+| # | Condition | Verdict |
+|---|---|---|
+| 1 | Empty text | drop |
+| 2 | Same text as the previous kept segment for the third time in a row | drop |
+| 3 | `compression_ratio > 2.4` (degenerate, repetitive decode) | drop |
+| 4 | `no_speech_prob > 0.6` **and** `avg_logprob < −1.0` | drop |
+| 5 | `avg_logprob < −1.5` | drop |
+| 6 | Known stock phrase ("thanks for watching", "amara.org", …) with low confidence | drop |
+| 7 | Same 1–4 word n-gram repeated back-to-back (4× for one word, 3× for longer) inside a segment | drop if low confidence, else flag |
+| 8 | `no_speech_prob > 0.4` or `avg_logprob < −1.0` | flag (kept) |
+| 9 | Otherwise | keep |
+
+Dropped and flagged segments, with reasons, are returned by `transcribe_detailed` for auditing.
 
 ### Stage 2: Raw → Refined transcript
 
-- **Programmatic edits, not regeneration** (RECOVER, arXiv 2603.16411). The LLM returns only a list of corrections. Pure Python validates each one and applies it with word-boundary regexes in a single pass, so text that was not proposed for correction cannot change and no content drift is possible.
+- **Programmatic edits, not regeneration** (RECOVER, arXiv 2603.16411). The LLM returns only a list of corrections. Pure Python validates each one and applies it with word-boundary regexes in a single, longest-match-first pass, so text that was not proposed for correction cannot change and no content drift is possible.
 - **Deterministic safety filters.** An edit is rejected if it touches:
   - digits or number words (`touches_digits`, `touches_number_words`)
   - negation (`touches_negation`)
   - commitment words such as *will, should, might* (`touches_commitment_word`)
   - person names, found by heuristic detection (`touches_person_name`)
-  - an overly long span, an ordinary word, or a span not found verbatim
+  - an overly long span (over 6 words), an ordinary word, or a span not found verbatim
 - **Phonetic "sounds-like" gate.** A correction must sound like the original (consonant-skeleton similarity, spelled-letter handling such as "see eye see dee" → "CICD"), which blocks synonym swaps and meaning changes.
 - **Glossary retrieval** (DARAG, Ghosh et al., ACL 2025). Phonetic and fuzzy matching of transcript n-grams against a user glossary. Only retrieved candidates are shown to the LLM.
 - **Final integrity assertion.** If the numbers or negations in the refined text differ from the raw text, the whole refinement is reverted.
@@ -114,7 +131,7 @@ Failures raise a `PipelineError` carrying a user-readable message, which the UI 
   Offending items are corrected or demoted to *open items*.
 - **Chain-of-Verification** (Dhuliawala et al., ACL 2024):
   1. *Deterministic step:* every `source_quote` attached to a decision or action item is fuzzy-matched against the transcript. Items whose quote cannot be found are not trusted.
-  2. *LLM step:* an isolated, independent check (it does not see the original draft's reasoning) verifies that the group *explicitly agreed* to each decision and that each task was *explicitly assigned*. Items failing the check are demoted.
+  2. *LLM step:* an isolated, independent check (it sees only the claim and the sentences around the quote, not the original draft's reasoning) verifies that the group *explicitly agreed* to each decision and that each task was *explicitly assigned*. Items failing the check are demoted.
 - **Ground-truth adherence.** An owner or deadline that is missing from the transcript is set to `"unspecified"`, and an owner name that never appears in the transcript is forced to `"unspecified"`.
 - **Multiple summary representations** (Asthana et al., CSCW 2024). The record carries both a one-sentence TL;DR and a detailed summary.
 - **Audit log.** Quote matches, critic adjustments, demoted proposals and forced `unspecified` owners are all exposed in the UI.
@@ -136,7 +153,7 @@ Failures raise a `PipelineError` carrying a user-readable message, which the UI 
 ├── .env                    # GROQ_API_KEY (create this; do not commit)
 ├── pipeline/
 │   ├── __init__.py
-│   ├── stt.py              # Stage 1: VAD chunking, Whisper, hallucination filters
+│   ├── stt.py              # Stage 1: decode, VAD chunking, Whisper, hallucination filters
 │   ├── refine.py           # Stage 2: RECOVER-style edits, DARAG retrieval, safety filters
 │   ├── document.py         # Stage 3: FRAME, critic pass, Chain-of-Verification
 │   └── run.py              # Orchestrator: streams progress, writes outputs
@@ -157,8 +174,8 @@ Failures raise a `PipelineError` carrying a user-readable message, which the UI 
 ### Prerequisites
 
 - Python 3.10 or newer
-- [FFmpeg](https://ffmpeg.org/download.html) available on your `PATH` (used to decode and downsample audio)
 - A [Groq API key](https://console.groq.com/keys)
+- FFmpeg. No manual install is needed: `imageio-ffmpeg` (in `requirements.txt`) bundles an FFmpeg binary, and a system-wide `ffmpeg` on your `PATH` is used first if present.
 
 ### Steps
 
@@ -178,6 +195,19 @@ pip install -r requirements.txt
 # 4. Configure the API key
 echo "GROQ_API_KEY=your_key_here" > .env
 ```
+
+`requirements.txt`:
+
+```
+groq
+gradio
+python-dotenv
+pydantic>=2
+webrtcvad-wheels
+imageio-ffmpeg
+```
+
+`webrtcvad-wheels` provides prebuilt wheels of the WebRTC voice-activity detector, so no C compiler is needed. If it fails to install, the pipeline still runs but without silence removal, which weakens the hallucination protection.
 
 Optional environment variable:
 
@@ -216,7 +246,7 @@ python app.py
 
 Open the local URL printed in the terminal (by default `http://127.0.0.1:7860`).
 
-1. **Upload audio.** Supported formats: `.mp3`, `.wav`, `.m4a`, `.mp4`, `.mpeg`, `.webm` (up to 500 MB). Invalid, empty or oversized files produce a red error banner immediately.
+1. **Upload audio.** Supported formats in the UI: `.mp3`, `.wav`, `.m4a`, `.mp4`, `.mpeg`, `.webm` (up to 500 MB). Invalid, empty or oversized files produce a red error banner immediately.
 2. **(Optional) Add glossary terms.** Enter project-specific terms (for example product names or acronyms), comma- or newline-separated. They are merged with `glossary.json` for this run.
 3. **Click "Process recording".** Step-by-step status is streamed live. If any stage fails, a clear error banner explains why.
 4. **Review the results in the tabs:**
@@ -256,7 +286,7 @@ pytest test_mesa.py -v
 | Invented owner | A task spoken with no assignee ("someone needs to update the deployment documentation") keeps owner `"unspecified"` |
 | Negation flip | "We will not adopt GraphQL" is never recorded as an affirmative adoption |
 
-The script prints PASS/FAIL per check and exits with a non-zero status on any failure.
+The script prints PASS/FAIL per check and exits with a non-zero status on any failure. Because Part B calls a stochastic LLM, a single pass is a smoke test rather than a statistical guarantee. Run it repeatedly to estimate reliability.
 
 ---
 
@@ -319,6 +349,8 @@ Guarantees:
 - Speaker diarisation is not performed, so ownership is taken only from names spoken in the transcript.
 - Person-name protection in refinement is heuristic (cue patterns and the optional `names` list in `glossary.json`), not a full NER model.
 - Output quality depends on audio quality. Heavily overlapping speech or very noisy recordings reduce transcript accuracy.
+- Uploads of up to 500 MB are accepted, but the whole recording is decoded into memory (about 115 MB of PCM per hour of audio), so multi-hour recordings need proportionally more RAM. Typical meetings of one to three hours are well within range.
+- Segment timestamps in the dropped and flagged logs are relative to the concatenated speech chunk sent to Whisper, not to the original recording.
 
 ---
 
