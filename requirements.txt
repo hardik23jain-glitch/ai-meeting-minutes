@@ -2,3 +2,5 @@ groq
 gradio
 python-dotenv
 pydantic>=2
+webrtcvad-wheels
+imageio-ffmpeg
